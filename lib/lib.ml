@@ -127,6 +127,7 @@ module Literal = struct
     | Negative -> Fmt.pf ppf "¬%d" i
   ;;
 
+  let pps = Fmt.(list pp ~sep:(any ", "))
   let complement (i, polarity) = i, Polarity.negate polarity
   let ( = ) (i1, p1) (i2, p2) = Int.(i1 = i2) && Polarity.(p1 = p2)
 
@@ -147,6 +148,7 @@ module Clause = struct
   let is_empty = List.is_empty
   let remove_unit v = List.filter ~f:(fun (v', _) -> Int.(v <> v'))
   let contains_literal = List.mem ~equal:Literal.( = )
+  let get_literal = function [ lit ] -> Some lit | _ -> None
 
   let%expect_test _ =
     let clause = [] in
@@ -183,64 +185,45 @@ module Cnf = struct
 
   (** Remove every clause containing [lit], discard the complement from every clause
       containing it *)
-  let unit_propagate clauses lit =
+  let propagate_unit clauses lit =
     List.fold clauses ~init:[] ~f:(fun clauses clause ->
-        if Clause.contains_literal clause lit
-        then clauses
-        else if Clause.contains_literal clause (Literal.complement lit)
-        then Clause.remove_unit (fst lit) clause :: clauses
-        else clauses)
+        match true with
+        | _ when Clause.contains_literal clause lit ->
+          (* this clause is satisfied, drop it *)
+          clauses
+        | _ when Clause.contains_literal clause (Literal.complement lit) ->
+          (* remove the unsatisfiable literal from this clause *)
+          Clause.remove_unit (fst lit) clause :: clauses
+        | _ -> clause :: clauses)
   ;;
 
-  let%expect_test "unit_propagate" =
+  let%expect_test "propagate_unit" =
     let clauses =
-      [ []
-      ; [ 1, Polarity.Positive; 2, Polarity.Negative ]
-      ; [ 1, Polarity.Negative; 2, Polarity.Positive ]
-      ]
+      [ []; [ 1, Polarity.Positive; 2, Negative ]; [ 1, Negative; 2, Positive ] ]
     in
     Fmt.pr "%a\n" pp clauses;
-    let go lit =
-      Fmt.pr "propagate %a -> %a\n" Literal.pp lit pp (unit_propagate clauses lit)
+    let go clauses lit =
+      Fmt.pr "propagate %a -> %a\n" Literal.pp lit pp (propagate_unit clauses lit)
     in
-    go (1, Polarity.Positive);
-    go (1, Polarity.Negative);
-    go (2, Polarity.Positive);
-    go (2, Polarity.Negative);
+    go clauses (1, Positive);
+    go clauses (1, Negative);
+    go clauses (2, Positive);
+    go clauses (2, Negative);
+    let clauses = [ [ 1, Polarity.Positive; 2, Negative ] ] in
+    Fmt.pr "%a\n" pp clauses;
+    go clauses (3, Negative);
     [%expect
       {|
       () ∧ (1 ∨ ¬2) ∧ (¬1 ∨ 2)
-      propagate 1 -> (2)
-      propagate ¬1 -> (¬2)
-      propagate 2 -> (1)
-      propagate ¬2 -> (¬1) |}]
+      propagate 1 -> (2) ∧ ()
+      propagate ¬1 -> (¬2) ∧ ()
+      propagate 2 -> (1) ∧ ()
+      propagate ¬2 -> (¬1) ∧ ()
+      (1 ∨ ¬2)
+      propagate ¬3 -> (1 ∨ ¬2) |}]
   ;;
 
-  (** Remove [v] from every clause, discard clauses that are now empty *)
-  let pure_literal_assign clauses v =
-    List.fold clauses ~init:[] ~f:(fun clauses clause ->
-        match Clause.remove_unit v clause with
-        | [] -> clauses
-        | clause -> clause :: clauses)
-  ;;
-
-  let%expect_test "pure_literal_assign" =
-    let clauses =
-      [ []
-      ; [ 1, Polarity.Positive; 2, Polarity.Negative ]
-      ; [ 1, Polarity.Negative; 2, Polarity.Positive ]
-      ]
-    in
-    Fmt.pr "%a\n" pp clauses;
-    Fmt.pr "assign 1 -> %a\n" pp (pure_literal_assign clauses 1);
-    Fmt.pr "assign 2 -> %a\n" pp (pure_literal_assign clauses 2);
-    [%expect
-      {|
-      () ∧ (1 ∨ ¬2) ∧ (¬1 ∨ 2)
-      assign 1 -> (2) ∧ (¬2)
-      assign 2 -> (¬1) ∧ (1) |}]
-  ;;
-
+  (** Find variables that occur with only one polarity. *)
   let pure_literals clauses =
     let polarity_table = Hashtbl.create (module Int) in
     let tombstones = Hash_set.create (module Int) in
@@ -255,88 +238,148 @@ module Cnf = struct
               then (
                 Hashtbl.remove polarity_table v;
                 Hash_set.add tombstones v)));
-    Hashtbl.keys polarity_table
+    Hashtbl.to_alist polarity_table
   ;;
 
   let%expect_test "pure_literals" =
-    let pp_list = Fmt.(list int ~sep:(any ", ")) in
     let go clauses =
-      Fmt.(pr "pure literals %a -> %a\n" pp clauses pp_list (pure_literals clauses))
+      Fmt.(pr "pure literals %a -> %a\n" pp clauses Literal.pps (pure_literals clauses))
     in
-    go
-      [ []
-      ; [ 1, Polarity.Positive; 2, Polarity.Negative ]
-      ; [ 1, Polarity.Negative; 2, Polarity.Positive ]
-      ];
-    go [ []; [ 1, Polarity.Positive; 2, Polarity.Negative ]; [ 2, Polarity.Positive ] ];
-    go [ []; [ 1, Polarity.Positive; 2, Polarity.Positive ]; [ 2, Polarity.Positive ] ];
+    go [ []; [ 1, Positive; 2, Negative ]; [ 1, Negative; 2, Positive ] ];
+    go [ []; [ 1, Positive; 2, Negative ]; [ 2, Positive ] ];
+    go [ []; [ 1, Positive; 2, Positive ]; [ 2, Positive ] ];
     [%expect
       {|
       pure literals () ∧ (1 ∨ ¬2) ∧ (¬1 ∨ 2) ->
       pure literals () ∧ (1 ∨ ¬2) ∧ (2) -> 1
       pure literals () ∧ (1 ∨ 2) ∧ (2) -> 2, 1 |}]
   ;;
+
+  module Literal_set = struct
+    type t =
+      | Inconsistent
+      | Consistent of (int, Polarity.t) Hashtbl.t
+      | Non_literal
+
+    let pp ppf = function
+      | Inconsistent -> Fmt.pf ppf "inconsistent"
+      | Consistent table -> Fmt.pf ppf "{%a}" Literal.pps (Hashtbl.to_alist table)
+      | Non_literal -> Fmt.pf ppf "non-literal"
+    ;;
+  end
+
+  let get_consistent_literal_set clauses =
+    match clauses |> List.map ~f:Clause.get_literal |> Option.all with
+    | None -> Literal_set.Non_literal
+    | Some literals ->
+      let polarities = Hashtbl.create (module Int) in
+      let is_consistent =
+        List.fold literals ~init:true ~f:(fun consistent (v, polarity) ->
+            if consistent
+            then (
+              match Hashtbl.find polarities v with
+              | None ->
+                Hashtbl.set polarities ~key:v ~data:polarity;
+                true
+              | Some polarity' -> Polarity.(polarity' = polarity))
+            else false)
+      in
+      if is_consistent then Consistent polarities else Inconsistent
+  ;;
+
+  let%expect_test "get_consistent_literal_set" =
+    let go clauses =
+      Fmt.pr
+        "get_consistent_literal_set %a -> %a\n"
+        pp
+        clauses
+        Literal_set.pp
+        (get_consistent_literal_set clauses)
+    in
+    go [ [] ];
+    go [ [ 1, Positive; 2, Negative ]; [ 2, Positive ] ];
+    go [ [ 1, Positive; 2, Positive ]; [ 2, Positive ] ];
+    go [ [ 2, Negative ]; [ 2, Positive ] ];
+    go [ [ 2, Positive ]; [ 2, Positive ] ];
+    [%expect
+      {|
+      get_consistent_literal_set () -> non-literal
+      get_consistent_literal_set (1 ∨ ¬2) ∧ (2) -> non-literal
+      get_consistent_literal_set (1 ∨ 2) ∧ (2) -> non-literal
+      get_consistent_literal_set (¬2) ∧ (2) -> inconsistent
+      get_consistent_literal_set (2) ∧ (2) -> {2} |}]
+  ;;
 end
 
 module Dpll = struct
   let dpll num_vars clauses =
-    let rec go var_assignments clauses =
-      (* Fmt.pr "go [%a] %a\n" Fmt.(list bool ~sep:(any ", ")) var_assignments Cnf.pp clauses; *)
-      let var_num = List.length var_assignments in
-      if Int.(var_num = num_vars)
-      then
-        (* Fmt.pr "go returning (1)\n"; *)
-        Some var_assignments
-        (* XXX have we checked the last assignment? *)
-      else if clauses |> List.find ~f:Clause.is_empty |> Option.is_some
-      then (* Fmt.pr "go returning (2)\n"; *)
-        None
-      else (
-        (* Fmt.pr "else branch clauses: %a\n" Cnf.pp clauses; *)
-        let clauses =
-          List.fold clauses ~init:clauses ~f:(fun clauses clause ->
-              match clause with [ lit ] -> Cnf.unit_propagate clauses lit | _ -> clauses)
-        in
-        (* Fmt.pr "clauses after unit propagation: %a\n" Cnf.pp clauses; *)
-        let clauses =
-          List.fold (Cnf.pure_literals clauses) ~init:clauses ~f:Cnf.pure_literal_assign
-        in
-        (* Fmt.pr "clauses after pure literal assignment: %a\n" Cnf.pp clauses; *)
-        if List.for_all clauses ~f:Clause.is_empty
+    let rec go var_num clauses =
+      match Cnf.get_consistent_literal_set clauses with
+      | Inconsistent -> None
+      | Consistent assignments ->
+        let unassigned_vars = num_vars - Hashtbl.length assignments in
+        unassigned_vars
+        |> List.init ~f:(fun i -> num_vars - 1 - i, Polarity.Positive)
+        |> List.iter ~f:(fun (key, data) -> Hashtbl.set assignments ~key ~data);
+        Some assignments
+      | Non_literal ->
+        if clauses |> List.find ~f:Clause.is_empty |> Option.is_some
         then None
         else (
-          match go (true :: var_assignments) ([ var_num, Positive ] :: clauses) with
-          | None -> go (false :: var_assignments) ([ var_num, Negative ] :: clauses)
-          | result -> result))
+          let new_assignments, clauses =
+            List.fold
+              clauses
+              ~init:([], clauses)
+              ~f:(fun (new_assignments, clauses) clause ->
+                match clause with
+                | [ lit ] -> [ lit ] :: new_assignments, Cnf.propagate_unit clauses lit
+                | _ -> new_assignments, clauses)
+          in
+          let pure_literals = Cnf.pure_literals (new_assignments @ clauses) in
+          let clauses = List.fold pure_literals ~init:clauses ~f:Cnf.propagate_unit in
+          let clauses =
+            List.map ~f:List.return pure_literals @ new_assignments @ clauses
+          in
+          if List.for_all clauses ~f:Clause.is_empty
+          then None
+          else (
+            match go (var_num + 1) ([ var_num, Positive ] :: clauses) with
+            | None -> go (var_num + 1) ([ var_num, Negative ] :: clauses)
+            | result -> result))
     in
-    go [] clauses
+    go 0 clauses
   ;;
 
   let%expect_test "dpll" =
-    let go n clauses =
-      Fmt.(
-        pr
-          "dpll %a -> %a\n"
-          Cnf.pp
-          clauses
-          (option ~none:(any "none") (brackets (list bool ~sep:(any ", "))))
-          (dpll n clauses))
+    let pp_result ppf = function
+      | None -> Fmt.pf ppf "none"
+      | Some table -> Fmt.pf ppf "{%a}" Literal.pps (Hashtbl.to_alist table)
     in
+    let go n clauses =
+      Fmt.(pr "dpll %a -> %a\n" Cnf.pp clauses pp_result (dpll n clauses))
+    in
+    go 2 [ [ 0, Positive; 1, Negative ]; [ 0, Negative; 1, Positive ] ];
+    go 2 [ [ 0, Positive; 1, Negative ]; [ 0, Positive; 1, Positive ] ];
+    go 1 [ [ 0, Positive ]; [ 0, Negative ] ];
     go
-      2
-      [ [ 1, Polarity.Positive; 2, Polarity.Negative ]
-      ; [ 1, Polarity.Negative; 2, Polarity.Positive ]
+      5
+      [ [ 0, Positive; 1, Positive; 2, Positive ]
+      ; [ 1, Positive; 2, Negative; 4, Negative ]
+      ; [ 1, Negative; 5, Positive ]
       ];
     go
-      2
-      [ [ 1, Polarity.Positive; 2, Polarity.Negative ]
-      ; [ 1, Polarity.Positive; 2, Polarity.Positive ]
+      3
+      [ [ 0, Positive; 1, Positive ]
+      ; [ 0, Positive; 1, Negative ]
+      ; [ 0, Negative; 2, Positive ]
+      ; [ 0, Negative; 2, Negative ]
       ];
-    go 1 [ [ 0, Polarity.Positive ]; [ 0, Polarity.Negative ] ];
     [%expect
       {|
-      dpll (1 ∨ ¬2) ∧ (¬1 ∨ 2) -> [true, true]
-      dpll (1 ∨ ¬2) ∧ (1 ∨ 2) -> [true, true]
-      dpll (1) ∧ (¬1) -> none |}]
+      dpll (0 ∨ ¬1) ∧ (¬0 ∨ 1) -> {1, 0}
+      dpll (0 ∨ ¬1) ∧ (0 ∨ 1) -> {1, 0}
+      dpll (0) ∧ (¬0) -> none
+      dpll (0 ∨ 1 ∨ 2) ∧ (1 ∨ ¬2 ∨ ¬4) ∧ (¬1 ∨ 5) -> {4, 3, 5, 0}
+      dpll (0 ∨ 1) ∧ (0 ∨ ¬1) ∧ (¬0 ∨ 2) ∧ (¬0 ∨ ¬2) -> none |}]
   ;;
 end
