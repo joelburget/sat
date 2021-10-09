@@ -1,0 +1,3 @@
+(executable
+ (libraries base satlib fmt)
+ (name sat))

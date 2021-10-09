@@ -1,0 +1,7 @@
+(library
+ (name satlib)
+ (public_name satlib)
+ (libraries base fmt)
+ (inline_tests)
+ (preprocess
+  (pps ppx_expect)))
