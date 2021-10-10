@@ -290,18 +290,18 @@ module Cnf = struct
     type t =
       | Inconsistent
       | Consistent of (int, Polarity.t) Hashtbl.t
-      | No_literals
+      | Non_literals_exist
 
     let pp ppf = function
       | Inconsistent -> Fmt.pf ppf "inconsistent"
       | Consistent table -> Fmt.pf ppf "{%a}" Literal.pps (Hashtbl.to_alist table)
-      | No_literals -> Fmt.pf ppf "no-literals"
+      | Non_literals_exist -> Fmt.pf ppf "non-literals"
     ;;
   end
 
   let get_consistent_literal_set clauses =
     match clauses |> List.map ~f:Clause.get_literal |> Option.all with
-    | None -> Literal_set.No_literals
+    | None -> Literal_set.Non_literals_exist
     | Some literals ->
       let polarities = Hashtbl.create (module Int) in
       let is_consistent =
@@ -333,97 +333,106 @@ module Cnf = struct
     go [ [ 2, Positive ]; [ 2, Positive ] ];
     [%expect
       {|
-      get_consistent_literal_set () -> no-literals
-      get_consistent_literal_set (1 ∨ ¬2) ∧ (2) -> no-literals
-      get_consistent_literal_set (1 ∨ 2) ∧ (2) -> no-literals
+      get_consistent_literal_set () -> non-literals
+      get_consistent_literal_set (1 ∨ ¬2) ∧ (2) -> non-literals
+      get_consistent_literal_set (1 ∨ 2) ∧ (2) -> non-literals
       get_consistent_literal_set (¬2) ∧ (2) -> inconsistent
       get_consistent_literal_set (2) ∧ (2) -> {2} |}]
   ;;
 end
 
 module Dpll = struct
+  exception Exit_inconsistent
+
+  (* Propagate a single unit. *)
+  let propagate_unit unit_clauses new_units non_unit_clauses lit =
+    let Cnf.{ new_pure_literals; clauses = new_clauses; contradictory } =
+      Cnf.propagate_unit !non_unit_clauses lit
+    in
+    if contradictory then raise Exit_inconsistent;
+    new_units := !new_units @ new_pure_literals;
+    List.iter new_pure_literals ~f:(Stack.push unit_clauses);
+    non_unit_clauses := new_clauses
+  ;;
+
+  (* Propagate units in [unit_clauses] until a fixed-point is reached. *)
+  let propagate_lits unit_clauses new_units non_unit_clauses =
+    Stack.until_empty
+      unit_clauses
+      (propagate_unit unit_clauses new_units non_unit_clauses);
+    !new_units, !non_unit_clauses
+  ;;
+
+  (* Unit propagation: find all units and propagate to a fixed-point. *)
   let unit_propagate clauses =
     let new_units, non_unit_clauses =
       List.partition_map clauses ~f:(function
           | [ lit ] -> Either.First lit
           | clause -> Second clause)
     in
-    let non_unit_clauses = ref non_unit_clauses in
-    let unit_clauses = Stack.of_list new_units in
-    let new_units = ref new_units in
-    Stack.until_empty unit_clauses (fun lit ->
-        let Cnf.{ new_pure_literals; clauses = new_clauses; _ } =
-          Cnf.propagate_unit !non_unit_clauses lit
-        in
-        new_units := !new_units @ new_pure_literals;
-        List.iter new_pure_literals ~f:(Stack.push unit_clauses);
-        non_unit_clauses := new_clauses);
-    !new_units, !non_unit_clauses
+    propagate_lits (Stack.of_list new_units) (ref new_units) (ref non_unit_clauses)
   ;;
 
+  (* Find all pure literals and eliminate until a fixed-point. *)
   let pure_literal_elimination clauses =
-    let pure_literals = Cnf.pure_literals clauses in
-    let non_unit_clauses = ref clauses in
-    let unit_clauses = Stack.create () in
-    let new_units = ref pure_literals in
-    let f lit =
-      let Cnf.{ new_pure_literals; clauses = new_clauses; _ } =
-        Cnf.propagate_unit !non_unit_clauses lit
+    let result = ref ([], clauses) in
+    let made_progress = ref true in
+    while !made_progress do
+      let previous_new_units, clauses = !result in
+      let pure_literals = Cnf.pure_literals clauses in
+      let new_units, clauses =
+        propagate_lits (Stack.of_list pure_literals) (ref pure_literals) (ref clauses)
       in
-      new_units := !new_units @ new_pure_literals;
-      List.iter new_pure_literals ~f:(Stack.push unit_clauses);
-      non_unit_clauses := new_clauses
-    in
-    List.iter pure_literals ~f;
-    Stack.until_empty unit_clauses f;
-    !new_units, !non_unit_clauses
-  ;;
-
-  exception Early_exit
-
-  let check_clause_solubility clauses =
-    if List.exists clauses ~f:Clause.is_empty then raise Early_exit
+      if List.is_empty new_units then made_progress := false;
+      result := new_units @ previous_new_units, clauses
+    done;
+    !result
   ;;
 
   let choose unsolved_vars = Set.min_elt_exn unsolved_vars
 
-  let dpll num_vars clauses0 =
-    let rec go unsolved_vars clauses =
+  type bcp_result =
+    | Solved of (int, Polarity.t) Hashtbl.t
+    | Inconsistent
+    | In_progress of (int, Int.comparator_witness) Set.t * Cnf.t
+
+  (* unit resolution until fixed point *)
+  let bcp unsolved_vars clauses =
+    try
+      (* First perform unit propagation *)
+      let new_units1, clauses = unit_propagate clauses in
+      let clauses = Cnf.of_units new_units1 @ clauses in
+      (* Next perform pure literal elimination *)
+      let new_units2, clauses = pure_literal_elimination clauses in
+      let clauses = Cnf.of_units new_units2 @ clauses in
+      (* Finally, continue with remaining unsolved vars *)
+      let newly_solved = List.map (new_units1 @ new_units2) ~f:fst in
+      let unsolved_vars =
+        Set.diff unsolved_vars (Set.of_list (module Int) newly_solved)
+      in
       match Cnf.get_consistent_literal_set clauses with
-      | Inconsistent -> None
+      | Inconsistent -> Inconsistent
       | Consistent assignments ->
         unsolved_vars
         |> Set.to_list
         |> List.iter ~f:(fun key -> Hashtbl.set assignments ~key ~data:Polarity.Positive);
-        Some assignments
-      | No_literals ->
-        (try
-           check_clause_solubility clauses;
-           (* First perform unit propagation *)
-           let unit_new_assignments, clauses = unit_propagate clauses in
-           let clauses = Cnf.of_units unit_new_assignments @ clauses in
-           check_clause_solubility clauses;
-           (* Next perform pure literal elimination *)
-           let pure_lit_new_assignments, clauses = pure_literal_elimination clauses in
-           let clauses = Cnf.of_units pure_lit_new_assignments @ clauses in
-           check_clause_solubility clauses;
-           (* Finally, continue with remaining unsolved vars *)
-           let newly_solved =
-             List.map (unit_new_assignments @ pure_lit_new_assignments) ~f:fst
-           in
-           let unsolved_vars =
-             Set.diff unsolved_vars (Set.of_list (module Int) newly_solved)
-           in
-           if Set.is_empty unsolved_vars
-           then go unsolved_vars clauses
-           else (
-             let chosen_var = choose unsolved_vars in
-             let unsolved_vars = Set.remove unsolved_vars chosen_var in
-             Option.first_some
-               (fun () -> go unsolved_vars ([ chosen_var, Positive ] :: clauses))
-               (fun () -> go unsolved_vars ([ chosen_var, Negative ] :: clauses)))
-         with
-        | Early_exit -> None)
+        Solved assignments
+      | Non_literals_exist -> In_progress (unsolved_vars, clauses)
+    with
+    | Exit_inconsistent -> Inconsistent
+  ;;
+
+  let dpll num_vars clauses0 =
+    let rec go unsolved_vars clauses =
+      match bcp unsolved_vars clauses with
+      | Inconsistent -> None
+      | Solved solution -> Some solution
+      | In_progress (unsolved_vars, clauses) ->
+        let chosen_var = choose unsolved_vars in
+        let unsolved_vars = Set.remove unsolved_vars chosen_var in
+        Option.first_some
+          (fun () -> go unsolved_vars ([ chosen_var, Positive ] :: clauses))
+          (fun () -> go unsolved_vars ([ chosen_var, Negative ] :: clauses))
     in
     let unsolved_vars = List.init num_vars ~f:Fn.id |> Set.of_list (module Int) in
     go unsolved_vars clauses0
@@ -474,7 +483,7 @@ module Dpll = struct
       dpll (0) ∧ (¬0) -> none
       dpll (0 ∨ 1 ∨ 2) ∧ (1 ∨ ¬2 ∨ ¬4) ∧ (¬1 ∨ 5) -> {1, 3, 2, ¬4, 5, 0}
       dpll (0 ∨ 1) ∧ (0 ∨ ¬1) ∧ (¬0 ∨ 2) ∧ (¬0 ∨ ¬2) -> none
-      dpll (0 ∨ 2) ∧ (0 ∨ ¬1 ∨ ¬4) ∧ (0 ∨ 4 ∨ 7) ∧ (¬3 ∨ ¬1 ∨ 5) ∧ (¬3 ∨ 4 ∨ ¬5) ∧ (3 ∨ 4 ∨ ¬6) ∧ (3 ∨ 6 ∨ ¬7) -> {¬1, 3, 2, 7, 6, 4, ¬5, 0} |}]
+      dpll (0 ∨ 2) ∧ (0 ∨ ¬1 ∨ ¬4) ∧ (0 ∨ 4 ∨ 7) ∧ (¬3 ∨ ¬1 ∨ 5) ∧ (¬3 ∨ 4 ∨ ¬5) ∧ (3 ∨ 4 ∨ ¬6) ∧ (3 ∨ 6 ∨ ¬7) -> {¬1, 3, 2, ¬7, 6, 4, ¬5, 0} |}]
     ;;
   end
 end
@@ -499,7 +508,7 @@ module Cdcl = struct
         |> Set.to_list
         |> List.iter ~f:(fun key -> Hashtbl.set assignments ~key ~data:Polarity.Positive);
         Success assignments
-      | No_literals ->
+      | Non_literals_exist ->
         (try
            check_clause_solubility clauses None;
            (* First perform unit propagation *)
@@ -561,6 +570,6 @@ module Cdcl = struct
       cdcl (0) ∧ (¬0) -> none
       cdcl (0 ∨ 1 ∨ 2) ∧ (1 ∨ ¬2 ∨ ¬4) ∧ (¬1 ∨ 5) -> {1, 3, 2, ¬4, 5, 0}
       cdcl (0 ∨ 1) ∧ (0 ∨ ¬1) ∧ (¬0 ∨ 2) ∧ (¬0 ∨ ¬2) -> none
-      cdcl (0 ∨ 2) ∧ (0 ∨ ¬1 ∨ ¬4) ∧ (0 ∨ 4 ∨ 7) ∧ (¬3 ∨ ¬1 ∨ 5) ∧ (¬3 ∨ 4 ∨ ¬5) ∧ (3 ∨ 4 ∨ ¬6) ∧ (3 ∨ 6 ∨ ¬7) -> {¬1, 3, 2, 7, 6, 4, ¬5, 0} |}]
+      cdcl (0 ∨ 2) ∧ (0 ∨ ¬1 ∨ ¬4) ∧ (0 ∨ 4 ∨ 7) ∧ (¬3 ∨ ¬1 ∨ 5) ∧ (¬3 ∨ 4 ∨ ¬5) ∧ (3 ∨ 4 ∨ ¬6) ∧ (3 ∨ 6 ∨ ¬7) -> {¬1, 3, 2, ¬7, 6, 4, ¬5, 0} |}]
   ;;
 end
