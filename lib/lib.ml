@@ -187,15 +187,17 @@ module Cnf = struct
   (** Remove every clause containing [lit], discard the complement from every clause
       containing it *)
   let propagate_unit clauses lit =
-    List.fold clauses ~init:[] ~f:(fun clauses clause ->
+    List.fold clauses ~init:([], []) ~f:(fun (new_pure_lits, clauses) clause ->
         match true with
         | _ when Clause.contains_literal clause lit ->
           (* this clause is satisfied, drop it *)
-          clauses
+          new_pure_lits, clauses
         | _ when Clause.contains_literal clause (Literal.complement lit) ->
           (* remove the unsatisfiable literal from this clause *)
-          Clause.remove_unit (fst lit) clause :: clauses
-        | _ -> clause :: clauses)
+          (match Clause.remove_unit (fst lit) clause with
+          | [ lit ] -> lit :: new_pure_lits, clauses
+          | clause -> new_pure_lits, clause :: clauses)
+        | _ -> new_pure_lits, clause :: clauses)
   ;;
 
   let%expect_test "propagate_unit" =
@@ -204,7 +206,16 @@ module Cnf = struct
     in
     Fmt.pr "%a\n" pp clauses;
     let go clauses lit =
-      Fmt.pr "propagate %a -> %a\n" Literal.pp lit pp (propagate_unit clauses lit)
+      let pp' ppf (new_pure_lits, clauses) =
+        Fmt.pf
+          ppf
+          "{ new_pure_lits = [%a]; clauses = %a }"
+          Fmt.(list Literal.pp ~sep:(any "; "))
+          new_pure_lits
+          pp
+          clauses
+      in
+      Fmt.pr "propagate %a -> %a\n" Literal.pp lit pp' (propagate_unit clauses lit)
     in
     go clauses (1, Positive);
     go clauses (1, Negative);
@@ -216,12 +227,12 @@ module Cnf = struct
     [%expect
       {|
       () ∧ (1 ∨ ¬2) ∧ (¬1 ∨ 2)
-      propagate 1 -> (2) ∧ ()
-      propagate ¬1 -> (¬2) ∧ ()
-      propagate 2 -> (1) ∧ ()
-      propagate ¬2 -> (¬1) ∧ ()
+      propagate 1 -> { new_pure_lits = [2]; clauses = () }
+      propagate ¬1 -> { new_pure_lits = [¬2]; clauses = () }
+      propagate 2 -> { new_pure_lits = [1]; clauses = () }
+      propagate ¬2 -> { new_pure_lits = [¬1]; clauses = () }
       (1 ∨ ¬2)
-      propagate ¬3 -> (1 ∨ ¬2) |}]
+      propagate ¬3 -> { new_pure_lits = []; clauses = (1 ∨ ¬2) } |}]
   ;;
 
   (** Find variables that occur with only one polarity. *)
@@ -313,6 +324,45 @@ module Cnf = struct
 end
 
 module Dpll = struct
+  let unit_propagate clauses =
+    let new_units, non_unit_clauses =
+      List.partition_map clauses ~f:(function
+          | [ lit ] -> Either.First lit
+          | clause -> Second clause)
+    in
+    let non_unit_clauses = ref non_unit_clauses in
+    let unit_clauses = Stack.of_list new_units in
+    let new_units = ref new_units in
+    Stack.until_empty unit_clauses (fun lit ->
+        let new_pure_lits, new_clauses = Cnf.propagate_unit !non_unit_clauses lit in
+        new_units := !new_units @ new_pure_lits;
+        List.iter new_pure_lits ~f:(Stack.push unit_clauses);
+        non_unit_clauses := new_clauses);
+    !new_units, !non_unit_clauses
+  ;;
+
+  let pure_literal_elimination clauses =
+    let pure_literals = Cnf.pure_literals clauses in
+    let non_unit_clauses = ref clauses in
+    let unit_clauses = Stack.create () in
+    let new_units = ref pure_literals in
+    let f lit =
+      let new_pure_lits, new_clauses = Cnf.propagate_unit !non_unit_clauses lit in
+      new_units := !new_units @ new_pure_lits;
+      List.iter new_pure_lits ~f:(Stack.push unit_clauses);
+      non_unit_clauses := new_clauses
+    in
+    List.iter pure_literals ~f;
+    Stack.until_empty unit_clauses f;
+    !new_units, !non_unit_clauses
+  ;;
+
+  exception Early_exit
+
+  let check_clause_solubility clauses =
+    if List.exists clauses ~f:Clause.is_empty then raise Early_exit
+  ;;
+
   let dpll num_vars clauses =
     let rec go unsolved_vars clauses =
       match Cnf.get_consistent_literal_set clauses with
@@ -323,41 +373,32 @@ module Dpll = struct
         |> List.iter ~f:(fun key -> Hashtbl.set assignments ~key ~data:Polarity.Positive);
         Some assignments
       | Non_literal ->
-        (* If there is an empty clause, fail *)
-        if List.exists clauses ~f:Clause.is_empty
-        then None
-        else (
-          (* First perform unit propagation *)
-          let new_assignments, non_unit_clauses =
-            List.partition_map clauses ~f:(function
-                | [ lit ] -> Either.First lit
-                | clause -> Second clause)
-          in
-          let non_unit_clauses = ref non_unit_clauses in
-          Stack.until_empty (Stack.of_list new_assignments) (fun lit ->
-              non_unit_clauses := Cnf.propagate_unit !non_unit_clauses lit);
-          let clauses = !non_unit_clauses in
-          (* Next perform pure literal elimination *)
-          let clauses = Cnf.of_units new_assignments @ clauses in
-          let pure_literals = Cnf.pure_literals clauses in
-          let new_assignments = pure_literals @ new_assignments in
-          let clauses = List.fold pure_literals ~init:clauses ~f:Cnf.propagate_unit in
-          let clauses = Cnf.of_units pure_literals @ clauses in
-          (* If there is an empty clause, fail immediately *)
-          if List.exists clauses ~f:Clause.is_empty
-          then None
-          else (
-            let unsolved_vars =
-              let newly_solved = List.map (new_assignments @ pure_literals) ~f:fst in
-              Set.diff unsolved_vars (Set.of_list (module Int) newly_solved)
-            in
-            match Set.min_elt unsolved_vars with
-            | Some chosen_var ->
-              let unsolved_vars = Set.remove unsolved_vars chosen_var in
-              (match go unsolved_vars ([ chosen_var, Positive ] :: clauses) with
-              | None -> go unsolved_vars ([ chosen_var, Negative ] :: clauses)
-              | result -> result)
-            | None -> go unsolved_vars clauses))
+        (try
+           check_clause_solubility clauses;
+           (* First perform unit propagation *)
+           let unit_new_assignments, clauses = unit_propagate clauses in
+           let clauses = Cnf.of_units unit_new_assignments @ clauses in
+           check_clause_solubility clauses;
+           (* Next perform pure literal elimination *)
+           let pure_lit_new_assignments, clauses = pure_literal_elimination clauses in
+           let clauses = Cnf.of_units pure_lit_new_assignments @ clauses in
+           check_clause_solubility clauses;
+           (* Finally, continue with remaining unsolved vars *)
+           let newly_solved =
+             List.map (unit_new_assignments @ pure_lit_new_assignments) ~f:fst
+           in
+           let unsolved_vars =
+             Set.diff unsolved_vars (Set.of_list (module Int) newly_solved)
+           in
+           match Set.min_elt unsolved_vars with
+           | Some chosen_var ->
+             let unsolved_vars = Set.remove unsolved_vars chosen_var in
+             (match go unsolved_vars ([ chosen_var, Positive ] :: clauses) with
+             | None -> go unsolved_vars ([ chosen_var, Negative ] :: clauses)
+             | result -> result)
+           | None -> go unsolved_vars clauses
+         with
+        | Early_exit -> None)
     in
     let unsolved_vars = List.init num_vars ~f:Fn.id |> Set.of_list (module Int) in
     go unsolved_vars clauses
