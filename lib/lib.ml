@@ -1,5 +1,11 @@
 open Base
 
+module Option = struct
+  include Option
+
+  let first_some f g = match f () with None -> g () | result -> result
+end
+
 module Nominal_problem = struct
   type t =
     | Var of string
@@ -66,8 +72,8 @@ module Index_problem = struct
       | 0 -> if eval assignments problem then Some assignments else None
       | _ ->
         Option.first_some
-          (go (true :: assignments) (n_vars - 1))
-          (go (false :: assignments) (n_vars - 1))
+          (fun () -> go (true :: assignments) (n_vars - 1))
+          (fun () -> go (false :: assignments) (n_vars - 1))
     in
     go [] n_vars
   ;;
@@ -284,30 +290,29 @@ module Cnf = struct
     type t =
       | Inconsistent
       | Consistent of (int, Polarity.t) Hashtbl.t
-      | Non_literal
+      | No_literals
 
     let pp ppf = function
       | Inconsistent -> Fmt.pf ppf "inconsistent"
       | Consistent table -> Fmt.pf ppf "{%a}" Literal.pps (Hashtbl.to_alist table)
-      | Non_literal -> Fmt.pf ppf "non-literal"
+      | No_literals -> Fmt.pf ppf "no-literals"
     ;;
   end
 
   let get_consistent_literal_set clauses =
     match clauses |> List.map ~f:Clause.get_literal |> Option.all with
-    | None -> Literal_set.Non_literal
+    | None -> Literal_set.No_literals
     | Some literals ->
       let polarities = Hashtbl.create (module Int) in
       let is_consistent =
         List.fold literals ~init:true ~f:(fun consistent (v, polarity) ->
-            if consistent
-            then (
-              match Hashtbl.find polarities v with
-              | None ->
-                Hashtbl.set polarities ~key:v ~data:polarity;
-                true
-              | Some polarity' -> Polarity.(polarity' = polarity))
-            else false)
+            consistent
+            &&
+            match Hashtbl.find polarities v with
+            | None ->
+              Hashtbl.set polarities ~key:v ~data:polarity;
+              true
+            | Some polarity' -> Polarity.(polarity' = polarity))
       in
       if is_consistent then Consistent polarities else Inconsistent
   ;;
@@ -328,9 +333,9 @@ module Cnf = struct
     go [ [ 2, Positive ]; [ 2, Positive ] ];
     [%expect
       {|
-      get_consistent_literal_set () -> non-literal
-      get_consistent_literal_set (1 ∨ ¬2) ∧ (2) -> non-literal
-      get_consistent_literal_set (1 ∨ 2) ∧ (2) -> non-literal
+      get_consistent_literal_set () -> no-literals
+      get_consistent_literal_set (1 ∨ ¬2) ∧ (2) -> no-literals
+      get_consistent_literal_set (1 ∨ 2) ∧ (2) -> no-literals
       get_consistent_literal_set (¬2) ∧ (2) -> inconsistent
       get_consistent_literal_set (2) ∧ (2) -> {2} |}]
   ;;
@@ -380,7 +385,9 @@ module Dpll = struct
     if List.exists clauses ~f:Clause.is_empty then raise Early_exit
   ;;
 
-  let dpll num_vars clauses =
+  let choose unsolved_vars = Set.min_elt_exn unsolved_vars
+
+  let dpll num_vars clauses0 =
     let rec go unsolved_vars clauses =
       match Cnf.get_consistent_literal_set clauses with
       | Inconsistent -> None
@@ -389,7 +396,7 @@ module Dpll = struct
         |> Set.to_list
         |> List.iter ~f:(fun key -> Hashtbl.set assignments ~key ~data:Polarity.Positive);
         Some assignments
-      | Non_literal ->
+      | No_literals ->
         (try
            check_clause_solubility clauses;
            (* First perform unit propagation *)
@@ -407,18 +414,19 @@ module Dpll = struct
            let unsolved_vars =
              Set.diff unsolved_vars (Set.of_list (module Int) newly_solved)
            in
-           match Set.min_elt unsolved_vars with
-           | Some chosen_var ->
+           if Set.is_empty unsolved_vars
+           then go unsolved_vars clauses
+           else (
+             let chosen_var = choose unsolved_vars in
              let unsolved_vars = Set.remove unsolved_vars chosen_var in
-             (match go unsolved_vars ([ chosen_var, Positive ] :: clauses) with
-             | None -> go unsolved_vars ([ chosen_var, Negative ] :: clauses)
-             | result -> result)
-           | None -> go unsolved_vars clauses
+             Option.first_some
+               (fun () -> go unsolved_vars ([ chosen_var, Positive ] :: clauses))
+               (fun () -> go unsolved_vars ([ chosen_var, Negative ] :: clauses)))
          with
         | Early_exit -> None)
     in
     let unsolved_vars = List.init num_vars ~f:Fn.id |> Set.of_list (module Int) in
-    go unsolved_vars clauses
+    go unsolved_vars clauses0
   ;;
 
   module Test = struct
@@ -491,7 +499,7 @@ module Cdcl = struct
         |> Set.to_list
         |> List.iter ~f:(fun key -> Hashtbl.set assignments ~key ~data:Polarity.Positive);
         Success assignments
-      | Non_literal ->
+      | No_literals ->
         (try
            check_clause_solubility clauses None;
            (* First perform unit propagation *)
