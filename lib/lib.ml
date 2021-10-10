@@ -428,12 +428,23 @@ module Dpll = struct
       ; [ 0, Negative; 2, Positive ]
       ; [ 0, Negative; 2, Negative ]
       ];
+    go
+      8
+      [ [ 0, Positive; 2, Positive ]
+      ; [ 0, Positive; 1, Negative; 4, Negative ]
+      ; [ 0, Positive; 4, Positive; 7, Positive ]
+      ; [ 3, Negative; 1, Negative; 5, Positive ]
+      ; [ 3, Negative; 4, Positive; 5, Negative ]
+      ; [ 3, Positive; 4, Positive; 6, Negative ]
+      ; [ 3, Positive; 6, Positive; 7, Negative ]
+      ];
     [%expect
       {|
       dpll (0 ∨ ¬1) ∧ (¬0 ∨ 1) -> {1, 0}
       dpll (0 ∨ ¬1) ∧ (0 ∨ 1) -> {1, 0}
       dpll (0) ∧ (¬0) -> none
       dpll (0 ∨ 1 ∨ 2) ∧ (1 ∨ ¬2 ∨ ¬4) ∧ (¬1 ∨ 5) -> {1, 3, 2, ¬4, 5, 0}
-      dpll (0 ∨ 1) ∧ (0 ∨ ¬1) ∧ (¬0 ∨ 2) ∧ (¬0 ∨ ¬2) -> none |}]
+      dpll (0 ∨ 1) ∧ (0 ∨ ¬1) ∧ (¬0 ∨ 2) ∧ (¬0 ∨ ¬2) -> none
+      dpll (0 ∨ 2) ∧ (0 ∨ ¬1 ∨ ¬4) ∧ (0 ∨ 4 ∨ 7) ∧ (¬3 ∨ ¬1 ∨ 5) ∧ (¬3 ∨ 4 ∨ ¬5) ∧ (3 ∨ 4 ∨ ¬6) ∧ (3 ∨ 6 ∨ ¬7) -> {¬1, 3, 2, 7, 6, 4, ¬5, 0} |}]
   ;;
 end
