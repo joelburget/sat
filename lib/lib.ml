@@ -182,6 +182,7 @@ module Cnf = struct
   type t = Clause.t list
 
   let pp = Fmt.(list ~sep:(any " ∧ ") Clause.pp)
+  let of_units literals = List.map literals ~f:List.return
 
   (** Remove every clause containing [lit], discard the complement from every clause
       containing it *)
@@ -322,31 +323,41 @@ module Dpll = struct
         |> List.iter ~f:(fun key -> Hashtbl.set assignments ~key ~data:Polarity.Positive);
         Some assignments
       | Non_literal ->
-        if clauses |> List.find ~f:Clause.is_empty |> Option.is_some
+        (* If there is an empty clause, fail *)
+        if List.exists clauses ~f:Clause.is_empty
         then None
         else (
-          let new_assignments, clauses =
-            List.fold
-              clauses
-              ~init:([], clauses)
-              ~f:(fun (new_assignments, clauses) clause ->
-                match clause with
-                | [ lit ] -> [ lit ] :: new_assignments, Cnf.propagate_unit clauses lit
-                | _ -> new_assignments, clauses)
+          (* First perform unit propagation *)
+          let new_assignments, non_unit_clauses =
+            List.partition_map clauses ~f:(function
+                | [ lit ] -> Either.First lit
+                | clause -> Second clause)
           in
-          let pure_literals = Cnf.pure_literals (new_assignments @ clauses) in
+          let non_unit_clauses = ref non_unit_clauses in
+          Stack.until_empty (Stack.of_list new_assignments) (fun lit ->
+              non_unit_clauses := Cnf.propagate_unit !non_unit_clauses lit);
+          let clauses = !non_unit_clauses in
+          (* Next perform pure literal elimination *)
+          let clauses = Cnf.of_units new_assignments @ clauses in
+          let pure_literals = Cnf.pure_literals clauses in
+          let new_assignments = pure_literals @ new_assignments in
           let clauses = List.fold pure_literals ~init:clauses ~f:Cnf.propagate_unit in
-          let clauses =
-            List.map ~f:List.return pure_literals @ new_assignments @ clauses
-          in
-          if List.for_all clauses ~f:Clause.is_empty
+          let clauses = Cnf.of_units pure_literals @ clauses in
+          (* If there is an empty clause, fail immediately *)
+          if List.exists clauses ~f:Clause.is_empty
           then None
           else (
-            let chosen_var = Set.min_elt_exn unsolved_vars in
-            let unsolved_vars = Set.remove unsolved_vars chosen_var in
-            match go unsolved_vars ([ chosen_var, Positive ] :: clauses) with
-            | None -> go unsolved_vars ([ chosen_var, Negative ] :: clauses)
-            | result -> result))
+            let unsolved_vars =
+              let newly_solved = List.map (new_assignments @ pure_literals) ~f:fst in
+              Set.diff unsolved_vars (Set.of_list (module Int) newly_solved)
+            in
+            match Set.min_elt unsolved_vars with
+            | Some chosen_var ->
+              let unsolved_vars = Set.remove unsolved_vars chosen_var in
+              (match go unsolved_vars ([ chosen_var, Positive ] :: clauses) with
+              | None -> go unsolved_vars ([ chosen_var, Negative ] :: clauses)
+              | result -> result)
+            | None -> go unsolved_vars clauses))
     in
     let unsolved_vars = List.init num_vars ~f:Fn.id |> Set.of_list (module Int) in
     go unsolved_vars clauses
@@ -381,7 +392,7 @@ module Dpll = struct
       dpll (0 ∨ ¬1) ∧ (¬0 ∨ 1) -> {1, 0}
       dpll (0 ∨ ¬1) ∧ (0 ∨ 1) -> {1, 0}
       dpll (0) ∧ (¬0) -> none
-      dpll (0 ∨ 1 ∨ 2) ∧ (1 ∨ ¬2 ∨ ¬4) ∧ (¬1 ∨ 5) -> {1, 3, 2, 4, 5, 0}
+      dpll (0 ∨ 1 ∨ 2) ∧ (1 ∨ ¬2 ∨ ¬4) ∧ (¬1 ∨ 5) -> {1, 3, 2, ¬4, 5, 0}
       dpll (0 ∨ 1) ∧ (0 ∨ ¬1) ∧ (¬0 ∨ 2) ∧ (¬0 ∨ ¬2) -> none |}]
   ;;
 end
