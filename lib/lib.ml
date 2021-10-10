@@ -313,14 +313,13 @@ end
 
 module Dpll = struct
   let dpll num_vars clauses =
-    let rec go var_num clauses =
+    let rec go unsolved_vars clauses =
       match Cnf.get_consistent_literal_set clauses with
       | Inconsistent -> None
       | Consistent assignments ->
-        let unassigned_vars = num_vars - Hashtbl.length assignments in
-        unassigned_vars
-        |> List.init ~f:(fun i -> num_vars - 1 - i, Polarity.Positive)
-        |> List.iter ~f:(fun (key, data) -> Hashtbl.set assignments ~key ~data);
+        unsolved_vars
+        |> Set.to_list
+        |> List.iter ~f:(fun key -> Hashtbl.set assignments ~key ~data:Polarity.Positive);
         Some assignments
       | Non_literal ->
         if clauses |> List.find ~f:Clause.is_empty |> Option.is_some
@@ -343,11 +342,14 @@ module Dpll = struct
           if List.for_all clauses ~f:Clause.is_empty
           then None
           else (
-            match go (var_num + 1) ([ var_num, Positive ] :: clauses) with
-            | None -> go (var_num + 1) ([ var_num, Negative ] :: clauses)
+            let chosen_var = Set.min_elt_exn unsolved_vars in
+            let unsolved_vars = Set.remove unsolved_vars chosen_var in
+            match go unsolved_vars ([ chosen_var, Positive ] :: clauses) with
+            | None -> go unsolved_vars ([ chosen_var, Negative ] :: clauses)
             | result -> result))
     in
-    go 0 clauses
+    let unsolved_vars = List.init num_vars ~f:Fn.id |> Set.of_list (module Int) in
+    go unsolved_vars clauses
   ;;
 
   let%expect_test "dpll" =
@@ -379,7 +381,7 @@ module Dpll = struct
       dpll (0 ∨ ¬1) ∧ (¬0 ∨ 1) -> {1, 0}
       dpll (0 ∨ ¬1) ∧ (0 ∨ 1) -> {1, 0}
       dpll (0) ∧ (¬0) -> none
-      dpll (0 ∨ 1 ∨ 2) ∧ (1 ∨ ¬2 ∨ ¬4) ∧ (¬1 ∨ 5) -> {4, 3, 5, 0}
+      dpll (0 ∨ 1 ∨ 2) ∧ (1 ∨ ¬2 ∨ ¬4) ∧ (¬1 ∨ 5) -> {1, 3, 2, 4, 5, 0}
       dpll (0 ∨ 1) ∧ (0 ∨ ¬1) ∧ (¬0 ∨ 2) ∧ (¬0 ∨ ¬2) -> none |}]
   ;;
 end
