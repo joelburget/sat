@@ -184,20 +184,32 @@ module Cnf = struct
   let pp = Fmt.(list ~sep:(any " ∧ ") Clause.pp)
   let of_units literals = List.map literals ~f:List.return
 
+  type propagation_result =
+    { contradictory : bool
+    ; new_pure_literals : Literal.t list
+    ; clauses : t
+    }
+
   (** Remove every clause containing [lit], discard the complement from every clause
       containing it *)
   let propagate_unit clauses lit =
-    List.fold clauses ~init:([], []) ~f:(fun (new_pure_lits, clauses) clause ->
+    let init = { contradictory = false; new_pure_literals = []; clauses = [] } in
+    List.fold
+      clauses
+      ~init
+      ~f:(fun { contradictory; new_pure_literals; clauses } clause ->
         match true with
         | _ when Clause.contains_literal clause lit ->
           (* this clause is satisfied, drop it *)
-          new_pure_lits, clauses
+          { contradictory; new_pure_literals; clauses }
         | _ when Clause.contains_literal clause (Literal.complement lit) ->
           (* remove the unsatisfiable literal from this clause *)
           (match Clause.remove_unit (fst lit) clause with
-          | [ lit ] -> lit :: new_pure_lits, clauses
-          | clause -> new_pure_lits, clause :: clauses)
-        | _ -> new_pure_lits, clause :: clauses)
+          | [] -> { contradictory = true; new_pure_literals; clauses }
+          | [ lit ] ->
+            { contradictory; new_pure_literals = lit :: new_pure_literals; clauses }
+          | clause -> { contradictory; new_pure_literals; clauses = clause :: clauses })
+        | _ -> { contradictory; new_pure_literals; clauses = clause :: clauses })
   ;;
 
   let%expect_test "propagate_unit" =
@@ -206,12 +218,13 @@ module Cnf = struct
     in
     Fmt.pr "%a\n" pp clauses;
     let go clauses lit =
-      let pp' ppf (new_pure_lits, clauses) =
+      let pp' ppf { contradictory; new_pure_literals; clauses } =
         Fmt.pf
           ppf
-          "{ new_pure_lits = [%a]; clauses = %a }"
+          "{ contradictory = %b; new_pure_literals = [%a]; clauses = %a }"
+          contradictory
           Fmt.(list Literal.pp ~sep:(any "; "))
-          new_pure_lits
+          new_pure_literals
           pp
           clauses
       in
@@ -227,12 +240,12 @@ module Cnf = struct
     [%expect
       {|
       () ∧ (1 ∨ ¬2) ∧ (¬1 ∨ 2)
-      propagate 1 -> { new_pure_lits = [2]; clauses = () }
-      propagate ¬1 -> { new_pure_lits = [¬2]; clauses = () }
-      propagate 2 -> { new_pure_lits = [1]; clauses = () }
-      propagate ¬2 -> { new_pure_lits = [¬1]; clauses = () }
+      propagate 1 -> { contradictory = false; new_pure_literals = [2]; clauses = () }
+      propagate ¬1 -> { contradictory = false; new_pure_literals = [¬2]; clauses = () }
+      propagate 2 -> { contradictory = false; new_pure_literals = [1]; clauses = () }
+      propagate ¬2 -> { contradictory = false; new_pure_literals = [¬1]; clauses = () }
       (1 ∨ ¬2)
-      propagate ¬3 -> { new_pure_lits = []; clauses = (1 ∨ ¬2) } |}]
+      propagate ¬3 -> { contradictory = false; new_pure_literals = []; clauses = (1 ∨ ¬2) } |}]
   ;;
 
   (** Find variables that occur with only one polarity. *)
@@ -334,9 +347,11 @@ module Dpll = struct
     let unit_clauses = Stack.of_list new_units in
     let new_units = ref new_units in
     Stack.until_empty unit_clauses (fun lit ->
-        let new_pure_lits, new_clauses = Cnf.propagate_unit !non_unit_clauses lit in
-        new_units := !new_units @ new_pure_lits;
-        List.iter new_pure_lits ~f:(Stack.push unit_clauses);
+        let Cnf.{ new_pure_literals; clauses = new_clauses; _ } =
+          Cnf.propagate_unit !non_unit_clauses lit
+        in
+        new_units := !new_units @ new_pure_literals;
+        List.iter new_pure_literals ~f:(Stack.push unit_clauses);
         non_unit_clauses := new_clauses);
     !new_units, !non_unit_clauses
   ;;
@@ -347,9 +362,11 @@ module Dpll = struct
     let unit_clauses = Stack.create () in
     let new_units = ref pure_literals in
     let f lit =
-      let new_pure_lits, new_clauses = Cnf.propagate_unit !non_unit_clauses lit in
-      new_units := !new_units @ new_pure_lits;
-      List.iter new_pure_lits ~f:(Stack.push unit_clauses);
+      let Cnf.{ new_pure_literals; clauses = new_clauses; _ } =
+        Cnf.propagate_unit !non_unit_clauses lit
+      in
+      new_units := !new_units @ new_pure_literals;
+      List.iter new_pure_literals ~f:(Stack.push unit_clauses);
       non_unit_clauses := new_clauses
     in
     List.iter pure_literals ~f;
@@ -404,47 +421,138 @@ module Dpll = struct
     go unsolved_vars clauses
   ;;
 
-  let%expect_test "dpll" =
+  module Test = struct
+    let test_cases =
+      [ 2, [ [ 0, Polarity.Positive; 1, Negative ]; [ 0, Negative; 1, Positive ] ]
+      ; 2, [ [ 0, Positive; 1, Negative ]; [ 0, Positive; 1, Positive ] ]
+      ; 1, [ [ 0, Positive ]; [ 0, Negative ] ]
+      ; ( 5
+        , [ [ 0, Positive; 1, Positive; 2, Positive ]
+          ; [ 1, Positive; 2, Negative; 4, Negative ]
+          ; [ 1, Negative; 5, Positive ]
+          ] )
+      ; ( 3
+        , [ [ 0, Positive; 1, Positive ]
+          ; [ 0, Positive; 1, Negative ]
+          ; [ 0, Negative; 2, Positive ]
+          ; [ 0, Negative; 2, Negative ]
+          ] )
+      ; ( 8
+        , [ [ 0, Positive; 2, Positive ]
+          ; [ 0, Positive; 1, Negative; 4, Negative ]
+          ; [ 0, Positive; 4, Positive; 7, Positive ]
+          ; [ 3, Negative; 1, Negative; 5, Positive ]
+          ; [ 3, Negative; 4, Positive; 5, Negative ]
+          ; [ 3, Positive; 4, Positive; 6, Negative ]
+          ; [ 3, Positive; 6, Positive; 7, Negative ]
+          ] )
+      ]
+    ;;
+
     let pp_result ppf = function
       | None -> Fmt.pf ppf "none"
       | Some table -> Fmt.pf ppf "{%a}" Literal.pps (Hashtbl.to_alist table)
-    in
-    let go n clauses =
-      Fmt.(pr "dpll %a -> %a\n" Cnf.pp clauses pp_result (dpll n clauses))
-    in
-    go 2 [ [ 0, Positive; 1, Negative ]; [ 0, Negative; 1, Positive ] ];
-    go 2 [ [ 0, Positive; 1, Negative ]; [ 0, Positive; 1, Positive ] ];
-    go 1 [ [ 0, Positive ]; [ 0, Negative ] ];
-    go
-      5
-      [ [ 0, Positive; 1, Positive; 2, Positive ]
-      ; [ 1, Positive; 2, Negative; 4, Negative ]
-      ; [ 1, Negative; 5, Positive ]
-      ];
-    go
-      3
-      [ [ 0, Positive; 1, Positive ]
-      ; [ 0, Positive; 1, Negative ]
-      ; [ 0, Negative; 2, Positive ]
-      ; [ 0, Negative; 2, Negative ]
-      ];
-    go
-      8
-      [ [ 0, Positive; 2, Positive ]
-      ; [ 0, Positive; 1, Negative; 4, Negative ]
-      ; [ 0, Positive; 4, Positive; 7, Positive ]
-      ; [ 3, Negative; 1, Negative; 5, Positive ]
-      ; [ 3, Negative; 4, Positive; 5, Negative ]
-      ; [ 3, Positive; 4, Positive; 6, Negative ]
-      ; [ 3, Positive; 6, Positive; 7, Negative ]
-      ];
-    [%expect
-      {|
+    ;;
+
+    let%expect_test "dpll" =
+      let go n clauses =
+        Fmt.(pr "dpll %a -> %a\n" Cnf.pp clauses pp_result (dpll n clauses))
+      in
+      List.iter test_cases ~f:(fun (n, clauses) -> go n clauses);
+      [%expect
+        {|
       dpll (0 ∨ ¬1) ∧ (¬0 ∨ 1) -> {1, 0}
       dpll (0 ∨ ¬1) ∧ (0 ∨ 1) -> {1, 0}
       dpll (0) ∧ (¬0) -> none
       dpll (0 ∨ 1 ∨ 2) ∧ (1 ∨ ¬2 ∨ ¬4) ∧ (¬1 ∨ 5) -> {1, 3, 2, ¬4, 5, 0}
       dpll (0 ∨ 1) ∧ (0 ∨ ¬1) ∧ (¬0 ∨ 2) ∧ (¬0 ∨ ¬2) -> none
       dpll (0 ∨ 2) ∧ (0 ∨ ¬1 ∨ ¬4) ∧ (0 ∨ 4 ∨ 7) ∧ (¬3 ∨ ¬1 ∨ 5) ∧ (¬3 ∨ 4 ∨ ¬5) ∧ (3 ∨ 4 ∨ ¬6) ∧ (3 ∨ 6 ∨ ¬7) -> {¬1, 3, 2, 7, 6, 4, ¬5, 0} |}]
+    ;;
+  end
+end
+
+module Cdcl = struct
+  type result =
+    | Success of (int, Polarity.t) Hashtbl.t
+    | Added_clauses of Clause.t list * (int, Int.comparator_witness) Set.t
+
+  exception Early_exit of Clause.t option
+
+  let check_clause_solubility clauses conflict_clause_opt =
+    if List.exists clauses ~f:Clause.is_empty then raise (Early_exit conflict_clause_opt)
+  ;;
+
+  let cdcl num_vars clauses =
+    let rec go unsolved_vars clauses =
+      match Cnf.get_consistent_literal_set clauses with
+      | Inconsistent -> Added_clauses ([], Set.empty (module Int))
+      | Consistent assignments ->
+        unsolved_vars
+        |> Set.to_list
+        |> List.iter ~f:(fun key -> Hashtbl.set assignments ~key ~data:Polarity.Positive);
+        Success assignments
+      | Non_literal ->
+        (try
+           check_clause_solubility clauses None;
+           (* First perform unit propagation *)
+           let unit_new_assignments, clauses = Dpll.unit_propagate clauses in
+           let clauses = Cnf.of_units unit_new_assignments @ clauses in
+           (* check_clause_solubility clauses; *)
+           (* Next perform pure literal elimination *)
+           let pure_lit_new_assignments, clauses =
+             Dpll.pure_literal_elimination clauses
+           in
+           let clauses = Cnf.of_units pure_lit_new_assignments @ clauses in
+           (* Finally, continue with remaining unsolved vars *)
+           let newly_solved =
+             List.map (unit_new_assignments @ pure_lit_new_assignments) ~f:fst
+           in
+           (* TODO: check_clause_solubility clauses; *)
+           let unsolved_vars =
+             Set.diff unsolved_vars (Set.of_list (module Int) newly_solved)
+           in
+           match Set.min_elt unsolved_vars with
+           | Some chosen_var ->
+             let unsolved_vars = Set.remove unsolved_vars chosen_var in
+             let result = go unsolved_vars ([ chosen_var, Positive ] :: clauses) in
+             (match result with
+             | Added_clauses (added_clauses, var_set) ->
+               (* backtracking -- only resume if we made a choice here re a
+                * variable in the conflict clause.
+                * TODO: check polarity, only resume if we made the wrong choice *)
+               if Set.mem var_set chosen_var
+               then
+                 go unsolved_vars ([ chosen_var, Negative ] :: (added_clauses @ clauses))
+               else result
+             | _ -> result)
+           | None -> go unsolved_vars clauses
+         with
+        | Early_exit conflict_clause_opt ->
+          let clauses, var_set =
+            match conflict_clause_opt with
+            | None -> [], Set.empty (module Int)
+            | Some conflict_clause ->
+              ( [ conflict_clause ]
+              , conflict_clause |> List.map ~f:fst |> Set.of_list (module Int) )
+          in
+          Added_clauses (clauses, var_set))
+    in
+    let unsolved_vars = List.init num_vars ~f:Fn.id |> Set.of_list (module Int) in
+    match go unsolved_vars clauses with Success result -> Some result | _ -> None
+  ;;
+
+  let%expect_test "cdcl" =
+    let go n clauses =
+      Fmt.(pr "cdcl %a -> %a\n" Cnf.pp clauses Dpll.Test.pp_result (cdcl n clauses))
+    in
+    List.iter Dpll.Test.test_cases ~f:(fun (n, clauses) -> go n clauses);
+    [%expect
+      {|
+      cdcl (0 ∨ ¬1) ∧ (¬0 ∨ 1) -> {1, 0}
+      cdcl (0 ∨ ¬1) ∧ (0 ∨ 1) -> {1, 0}
+      cdcl (0) ∧ (¬0) -> none
+      cdcl (0 ∨ 1 ∨ 2) ∧ (1 ∨ ¬2 ∨ ¬4) ∧ (¬1 ∨ 5) -> {1, 3, 2, ¬4, 5, 0}
+      cdcl (0 ∨ 1) ∧ (0 ∨ ¬1) ∧ (¬0 ∨ 2) ∧ (¬0 ∨ ¬2) -> none
+      cdcl (0 ∨ 2) ∧ (0 ∨ ¬1 ∨ ¬4) ∧ (0 ∨ 4 ∨ 7) ∧ (¬3 ∨ ¬1 ∨ 5) ∧ (¬3 ∨ 4 ∨ ¬5) ∧ (3 ∨ 4 ∨ ¬6) ∧ (3 ∨ 6 ∨ ¬7) -> {¬1, 3, 2, 7, 6, 4, ¬5, 0} |}]
   ;;
 end
